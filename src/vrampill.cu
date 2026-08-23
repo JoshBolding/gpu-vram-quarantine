@@ -62,30 +62,44 @@ unsigned int genval(unsigned long long gidx, unsigned int pat, int mode)
     return pat;
 }
 
-__global__ void kfill(unsigned int* p, unsigned long long n,
-                      unsigned long long base, unsigned int pat, int mode)
+// Every chunk is the same size, so one launch can sweep all of them: the grid
+// is (blocks-per-chunk, nchunk) and blockIdx.y selects the chunk through a
+// device-side pointer table. Launching once per chunk instead meant thousands
+// of tiny launches per pass at 8 MiB granularity, and the per-launch overhead
+// was comparable to the memory traffic itself. Fewer launches per pass means
+// more passes per second, which is more chances to provoke the fault inside
+// the same --find-seconds budget.
+//
+// The global index passed to genval is chunk*cn + i, identical to the old
+// per-chunk base + i, so the patterns written are unchanged.
+__global__ void kfill(unsigned int* const* chunks, unsigned long long cn,
+                      unsigned int pat, int mode)
 {
+    unsigned int*      p    = chunks[blockIdx.y];
+    unsigned long long base = (unsigned long long)blockIdx.y * cn;
     unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
-    for (; i < n; i += stride) p[i] = genval(base + i, pat, mode);
+    for (; i < cn; i += stride) p[i] = genval(base + i, pat, mode);
 }
 
 // Per-chunk error flags live on the device so that a whole sweep costs one
 // host copy rather than one per chunk. With thousands of chunks that is the
 // difference between a usable search and an unusably slow one.
-__global__ void kcheck(const unsigned int* p, unsigned long long n,
-                       unsigned long long base, unsigned int pat, int mode,
-                       int cidx, unsigned int* chunkhits,
+__global__ void kcheck(const unsigned int* const* chunks, unsigned long long cn,
+                       unsigned int pat, int mode, unsigned int* chunkhits,
                        unsigned long long* chunkidx, unsigned int* chunkxor)
 {
+    int                 c    = blockIdx.y;
+    const unsigned int* p    = chunks[c];
+    unsigned long long  base = (unsigned long long)c * cn;
     unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
-    for (; i < n; i += stride) {
+    for (; i < cn; i += stride) {
         unsigned int want = genval(base + i, pat, mode);
         unsigned int got  = p[i];
         if (got != want) {
-            if (atomicAdd(&chunkhits[cidx], 1u) == 0u) chunkidx[cidx] = i;
-            atomicOr(&chunkxor[cidx], want ^ got);
+            if (atomicAdd(&chunkhits[c], 1u) == 0u) chunkidx[c] = i;
+            atomicOr(&chunkxor[c], want ^ got);
         }
     }
 }
@@ -140,25 +154,20 @@ int main(int argc, char** argv)
            find_secs, quiet_secs);
     fflush(stdout);
 
-    static unsigned int*      chunk[MAXCHUNK];
-    static unsigned long long celems[MAXCHUNK];
-    static unsigned long long cbase[MAXCHUNK];
-    static unsigned char      isbad[MAXCHUNK];
+    static unsigned int* chunk[MAXCHUNK];
+    static unsigned char isbad[MAXCHUNK];
     int    nchunk = 0;
     size_t got_total = 0;
 
     size_t csize  = chunk_mib * 1048576ULL;
     size_t target = (freeB > 640ULL * 1048576ULL) ? freeB - 640ULL * 1048576ULL : 0;
+    unsigned long long cn = csize / 4ULL;   // elements per chunk (all chunks equal)
 
-    unsigned long long base = 0;
     while (nchunk < MAXCHUNK && got_total + csize <= target) {
         void* p = NULL;
         if (cudaMalloc(&p, csize) != cudaSuccess) { cudaGetLastError(); break; }
-        chunk[nchunk]  = (unsigned int*)p;
-        celems[nchunk] = csize / 4ULL;
-        cbase[nchunk]  = base;
-        isbad[nchunk]  = 0;
-        base      += celems[nchunk];
+        chunk[nchunk] = (unsigned int*)p;
+        isbad[nchunk] = 0;
         got_total += csize;
         nchunk++;
     }
@@ -179,12 +188,15 @@ int main(int argc, char** argv)
 
     unsigned int       *d_hits, *d_xor;
     unsigned long long *d_idx;
-    CK(cudaMalloc(&d_hits, sizeof(unsigned int) * nchunk));
-    CK(cudaMalloc(&d_xor,  sizeof(unsigned int) * nchunk));
-    CK(cudaMalloc(&d_idx,  sizeof(unsigned long long) * nchunk));
+    unsigned int*      *d_chunks;
+    CK(cudaMalloc(&d_hits,   sizeof(unsigned int) * nchunk));
+    CK(cudaMalloc(&d_xor,    sizeof(unsigned int) * nchunk));
+    CK(cudaMalloc(&d_idx,    sizeof(unsigned long long) * nchunk));
+    CK(cudaMalloc(&d_chunks, sizeof(unsigned int*) * nchunk));
     CK(cudaMemset(d_hits, 0, sizeof(unsigned int) * nchunk));
     CK(cudaMemset(d_xor,  0, sizeof(unsigned int) * nchunk));
     CK(cudaMemset(d_idx,  0, sizeof(unsigned long long) * nchunk));
+    CK(cudaMemcpy(d_chunks, chunk, sizeof(unsigned int*) * nchunk, cudaMemcpyHostToDevice));
 
     unsigned int* h_hits = (unsigned int*)calloc(nchunk, sizeof(unsigned int));
     unsigned int* h_xor  = (unsigned int*)calloc(nchunk, sizeof(unsigned int));
@@ -205,8 +217,13 @@ int main(int argc, char** argv)
     for (int b = 0; b < 32; b++) pats[npat++] = (1u << b);
     for (int b = 0; b < 32; b++) pats[npat++] = ~(1u << b);
 
+    // One launch per pass: grid.y walks chunks, grid.x walks within a chunk.
+    // Aim for plenty of blocks in flight overall, whatever the chunk count.
     int threads = 256;
-    int blocks  = prop.multiProcessorCount * 16;
+    int bpc = (prop.multiProcessorCount * 64 + nchunk - 1) / nchunk;
+    if (bpc < 4)   bpc = 4;
+    if (bpc > 256) bpc = 256;
+    dim3 grid((unsigned)bpc, (unsigned)nchunk);
 
     printf("searching (faults are often temperature-gated; the card must warm up)...\n");
     fflush(stdout);
@@ -227,13 +244,12 @@ int main(int argc, char** argv)
         unsigned int pat  = pats[iter % npat];
         int          mode = (iter / npat) % 3;
 
-        for (int c = 0; c < nchunk; c++)
-            kfill<<<blocks, threads>>>(chunk[c], celems[c], cbase[c], pat, mode);
+        kfill<<<grid, threads>>>(d_chunks, cn, pat, mode);
+        CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
 
-        for (int c = 0; c < nchunk; c++)
-            kcheck<<<blocks, threads>>>(chunk[c], celems[c], cbase[c], pat, mode,
-                                        c, d_hits, d_idx, d_xor);
+        kcheck<<<grid, threads>>>(d_chunks, cn, pat, mode, d_hits, d_idx, d_xor);
+        CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
 
         CK(cudaMemcpy(h_hits, d_hits, sizeof(unsigned int) * nchunk, cudaMemcpyDeviceToHost));
@@ -244,7 +260,7 @@ int main(int argc, char** argv)
                 last_new = now_s();
                 CK(cudaMemcpy(h_idx, d_idx, sizeof(unsigned long long) * nchunk, cudaMemcpyDeviceToHost));
                 CK(cudaMemcpy(h_xor, d_xor, sizeof(unsigned int) * nchunk, cudaMemcpyDeviceToHost));
-                unsigned long long off = (cbase[c] + h_idx[c]) * 4ULL;
+                unsigned long long off = ((unsigned long long)c * cn + h_idx[c]) * 4ULL;
                 printf("  [%.0fs] BAD CELL #%d: chunk %d, offset 0x%llX (%.2f GiB), xor 0x%08X\n",
                        now_s() - t0, nbad, c, off, off / 1073741824.0, h_xor[c]);
                 fflush(stdout);
@@ -257,7 +273,9 @@ int main(int argc, char** argv)
         }
         iter++;
         if ((iter % 500) == 0) {
-            printf("  [%.0fs] %u iters, %d bad chunk(s) so far\n", now_s() - t0, iter, nbad);
+            double el2 = now_s() - t0;
+            printf("  [%.0fs] %u iters (%.1f/s), %d bad chunk(s) so far\n",
+                   el2, iter, iter / el2, nbad);
             fflush(stdout);
         }
     }
@@ -285,17 +303,18 @@ int main(int argc, char** argv)
     // Release everything except the chunks holding defects.
     size_t held = 0, freed = 0;
     for (int c = 0; c < nchunk; c++) {
-        if (isbad[c]) { held += celems[c] * 4ULL; continue; }
+        if (isbad[c]) { held += csize; continue; }
         cudaFree(chunk[c]);
-        freed += celems[c] * 4ULL;
+        freed += csize;
     }
-    cudaFree(d_hits); cudaFree(d_xor); cudaFree(d_idx);
+    cudaFree(d_hits); cudaFree(d_xor); cudaFree(d_idx); cudaFree(d_chunks);
 
     size_t f2 = 0, t2 = 0;
     cudaMemGetInfo(&f2, &t2);
 
     printf("\n=== QUARANTINE ACTIVE ===\n");
-    printf("searched     : %.0fs, %u iterations\n", searched, iter);
+    printf("searched     : %.0fs, %u iterations (%.1f/s)\n", searched, iter,
+           searched > 0 ? iter / searched : 0.0);
     printf("bad chunks   : %d\n", nbad);
     printf("held         : %.1f MiB\n", held / 1048576.0);
     printf("released     : %.2f GiB\n", freed / 1073741824.0);
@@ -309,7 +328,7 @@ int main(int argc, char** argv)
             for (int c = 0; c < nchunk; c++)
                 if (isbad[c])
                     fprintf(f, "bad_offset=0x%llX xor=0x%08X\n",
-                            (unsigned long long)((cbase[c] + h_idx[c]) * 4ULL), h_xor[c]);
+                            ((unsigned long long)c * cn + h_idx[c]) * 4ULL, h_xor[c]);
             fclose(f);
             printf("ready marker : %s\n", ready_file);
         } else {
