@@ -31,6 +31,10 @@ dependent services do not start. That is intentional. A search that failed to
 provoke the fault looks exactly like a healthy card, and starting a VRAM workload
 on that assumption is how you get silent corruption.
 
+The units use `BindsTo=` rather than `Requires=` so that if `vrampill` exits for
+any reason (crash, OOM kill, signal), the gate goes inactive and every dependent
+workload is stopped. `Requires=` only reacts to an explicit `systemctl stop`.
+
 Verified: with the find budget forced to 5 seconds so the search could not
 succeed, the dependent services stayed inactive with "A dependency job failed".
 

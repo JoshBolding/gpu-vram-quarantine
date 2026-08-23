@@ -3,7 +3,8 @@
 # Card C may start before this succeeds.
 set -u
 READY="${READY:-/run/user/$(id -u)/vrampill.ready}"
-TIMEOUT="${TIMEOUT:-960}"
+# Must exceed vrampill's --find-seconds + --quiet-seconds (default 1800 + 180).
+TIMEOUT="${TIMEOUT:-2100}"
 for i in $(seq 1 "$TIMEOUT"); do
   if [ -f "$READY" ]; then
     echo "quarantine ready after ${i}s:"
