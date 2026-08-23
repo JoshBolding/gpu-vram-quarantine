@@ -1,0 +1,18 @@
+# Quarantine defective VRAM cells before anything can allocate them.
+# Install to ~/.config/systemd/user/ and edit BAD_SERIAL below.
+[Unit]
+Description=Quarantine defective VRAM cells
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment=BAD_SERIAL=CHANGEME
+Environment=PILL=%h/gpu-vram-quarantine/vrampill
+ExecStart=%h/gpu-vram-quarantine/examples/systemd/vrampill-guard.sh
+Restart=on-failure
+RestartSec=30
+# Temperature-gated faults can need minutes of load to appear. Be generous.
+TimeoutStartSec=2400
+
+[Install]
+WantedBy=default.target

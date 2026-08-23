@@ -1,0 +1,15 @@
+# Gate. Succeeds only once the quarantine is confirmed active. Anything that
+# fills VRAM should depend on THIS, not on vrampill.service directly.
+[Unit]
+Description=Gate: VRAM quarantine confirmed active
+After=vrampill.service
+Requires=vrampill.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/gpu-vram-quarantine/examples/systemd/vrampill-wait.sh
+TimeoutStartSec=2400
+
+[Install]
+WantedBy=default.target
