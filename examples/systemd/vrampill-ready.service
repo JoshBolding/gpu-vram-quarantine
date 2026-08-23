@@ -3,7 +3,7 @@
 [Unit]
 Description=Gate: VRAM quarantine confirmed active
 After=vrampill.service
-Requires=vrampill.service
+BindsTo=vrampill.service
 
 [Service]
 Type=oneshot
