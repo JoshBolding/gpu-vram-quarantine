@@ -238,6 +238,11 @@ int main(int argc, char** argv)
     signal(SIGTERM, on_sig);
 
     CK(cudaSetDevice(dev));
+    // The context reserves a per-thread stack for every thread the card can
+    // run at once: 1 KiB by default, about 124 MiB on a 3090. None of the
+    // kernels here use any stack, so that reservation is pure waste for a
+    // process that exists to sit on a few MiB. Credit to xiconfjs (issue #3).
+    CK(cudaDeviceSetLimit(cudaLimitStackSize, 0));
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, dev));
 

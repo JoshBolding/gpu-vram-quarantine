@@ -251,8 +251,11 @@ How much of the card you keep:
 | **Quarantined** | **23,853 MiB** | **98.9%** |
 | Naive allocation cap below the fault | 20,480 MiB | 84.9% |
 
-The quarantine itself is 8 MiB. The rest of the 264 MiB cost is the holder
-process's CUDA context, which is unavoidable for any process that touches CUDA.
+The quarantine itself is 8 MiB. The rest of the 264 MiB cost in that table is
+the holder process's CUDA context. About 124 MiB of it was the default per-thread
+stack reservation, which vrampill no longer asks for (its kernels use no stack),
+so the holder now costs about 142 MiB on a 3090. The remaining ~134 MiB is fixed
+driver overhead that any process touching CUDA pays.
 
 The 64 °C matters: that is the temperature at which this card fails constantly
 without the quarantine.
